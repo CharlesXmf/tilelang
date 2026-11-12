@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import ptodsl._allreduce as _allreduce
 import ptodsl._scalar as _scalar
 from ptodsl import pto
 from ptodsl._scalar import _emit_llvm_byte_pointer
 from ptodsl._surface_values import VecValue, unwrap_surface_value, wrap_surface_value, resolve_address_access
-from ptodsl._types import _DType, _integer_signedness, _restore_integer_signedness, _signless_integer_type, _strip_integer_signedness
-from ptoas.mlir.dialects import llvm
+from ptodsl._types import _DType, _restore_integer_signedness, _signless_integer_type
+from ptoas.mlir.dialects import llvm, pto as _pto
 from ptoas.mlir.ir import IntegerType
 
 
@@ -146,59 +145,6 @@ def scalar_rsqrt(value):
     return 1.0 / pto.sqrt(value)
 
 
-def _redux_signedness(type_obj):
-    # Maps signed ints to signless pto.iXX (uint keeps pto.uiXX).
-    return "unsigned" if _integer_signedness(type_obj) == "unsigned" else "signed"
-
-
-def _redux_integer_compat(op, value, *, with_signedness):
-    raw_value = unwrap_surface_value(value)
-    if not IntegerType.isinstance(raw_value.type):
-        return op(value)
-    signless_value = wrap_surface_value(_strip_integer_signedness(raw_value))
-    if with_signedness:
-        result = op(signless_value, signedness=_redux_signedness(raw_value.type))
-    else:
-        result = op(signless_value)
-    return wrap_surface_value(_restore_integer_signedness(unwrap_surface_value(result), raw_value.type))
-
-
-def _redux_add(value):
-    # redux_add takes no signedness argument.
-    return _redux_integer_compat(pto.redux_add, value, with_signedness=False)
-
-
-def _redux_max(value):
-    # redux_max/min require an explicit integer signedness.
-    return _redux_integer_compat(pto.redux_max, value, with_signedness=True)
-
-
-def _redux_min(value):
-    return _redux_integer_compat(pto.redux_min, value, with_signedness=True)
-
-
-def _shuffle_bfly(value, offset):
-    raw_value = unwrap_surface_value(value)
-    if not IntegerType.isinstance(raw_value.type):
-        return pto.shuffle_bfly(value, offset)
-    signless_value = wrap_surface_value(_strip_integer_signedness(raw_value))
-    result = pto.shuffle_bfly(signless_value, offset)
-    return wrap_surface_value(_restore_integer_signedness(unwrap_surface_value(result), raw_value.type))
-
-
-# PTOAS's redux/shuffle take signless i32 carriers while its allreduce dispatches on signed/unsigned types.
-# Run the si32 strategy on the signless carrier with identity constants typed to match,
-# instead of reinterpreting to si32 and back.
-_allreduce._REDUCER_REDUX.update(
-    {
-        "sum": _redux_add,
-        "max": _redux_max,
-        "min": _redux_min,
-    }
-)
-_allreduce.shuffle_bfly = _shuffle_bfly
-_allreduce._REDUCER_IDENTITY_DTYPE["si32"] = pto.i32
-
 _scalar_select = _scalar.select
 
 
@@ -215,56 +161,19 @@ def _scalar_select_compat(cond, true_val, false_val):
 
 _scalar.select = _scalar_select_compat
 
-_simt_allreduce = _allreduce._simt_allreduce
 
+def integer_atomic(ptr, value, logical_dtype, operation):
+    """Adapt signed/unsigned TIR integers to PTOAS signless atomic carriers."""
+    from .common import wrap_const
 
-def _simt_allreduce_compat(value, *, threads, scale=1, thread_offset=0, scratch=None, reducer):
-    """Dispatch signless i32 through PTOAS's si32 strategy; other dtypes delegate."""
-    raw_value = unwrap_surface_value(value)
-    if not (
-        IntegerType.isinstance(raw_value.type)
-        and _integer_signedness(raw_value.type) == "signless"
-        and IntegerType(raw_value.type).width == 32
-    ):
-        return _simt_allreduce(
-            value,
-            threads=threads,
-            scale=scale,
-            thread_offset=thread_offset,
-            scratch=scratch,
-            reducer=reducer,
-        )
-    _allreduce._check_params(threads=threads, scale=scale, thread_offset=thread_offset)
-    if threads <= scale:
-        return value
-    args = dict(dtype="si32", threads=threads, scale=scale, thread_offset=thread_offset, reducer=reducer)
-    if threads <= 32 and _allreduce._is_pow2(threads) and _allreduce._is_pow2(scale):
-        return _allreduce._emit_warp_reduce(value, **args)
-    if scratch is None:
-        raise ValueError(f"all_reduce {reducer}/si32/t{threads}/s{scale}/o{thread_offset} requires a UB scratch buffer")
-    _allreduce._validate_scratch_buffer(
-        scratch,
-        value_type=raw_value.type,
-        reducer=reducer,
-        dtype="si32",
-        threads=threads,
-        scale=scale,
-        thread_offset=thread_offset,
-    )
-    if threads <= 32:
-        return _allreduce._emit_ub_reduce(value, scratch, **args)
-    if scale <= 32 and _allreduce._is_pow2(threads) and _allreduce._is_pow2(scale):
-        return _allreduce._emit_cross_warp_reduce(value, scratch, **args)
-    return _allreduce._emit_ub_reduce(value, scratch, **args)
-
-
-def simt_allreduce_sum(value, **kwargs):
-    return _simt_allreduce_compat(value, reducer="sum", **kwargs)
-
-
-def simt_allreduce_max(value, **kwargs):
-    return _simt_allreduce_compat(value, reducer="max", **kwargs)
-
-
-def simt_allreduce_min(value, **kwargs):
-    return _simt_allreduce_compat(value, reducer="min", **kwargs)
+    logical_type = IntegerType(logical_dtype.resolve())
+    payload_dtype = {32: pto.i32, 64: pto.i64}[logical_type.width]
+    pointer_type = _pto.PtrType(unwrap_surface_value(ptr).type)
+    payload_ptr_type = _pto.PtrType.get(payload_dtype.resolve(), memory_space=pointer_type.memory_space)
+    payload_ptr = pto.castptr(ptr, payload_ptr_type)
+    payload_value = pto.cast(wrap_const(value, logical_dtype), payload_dtype)
+    kwargs = {}
+    if operation in ("atomic_min", "atomic_max"):
+        kwargs["signedness"] = "unsigned" if logical_type.is_unsigned else "signed"
+    previous = getattr(pto, operation)(payload_ptr, payload_value, **kwargs)
+    return pto.cast(previous, logical_dtype)

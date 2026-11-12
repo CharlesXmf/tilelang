@@ -7,6 +7,23 @@ from tilelang import tvm as tvm
 from tvm.target import Target
 
 
+def get_output_scalar_dim_map(func: tvm.tirx.PrimFunc, result_idx: list[int]) -> dict[tuple[int, int], int]:
+    """Resolve output dimensions to authored scalar argument positions.
+
+    Match Vars only within the PrimFunc: cached KernelParam shapes are loaded
+    separately and do not share Var identities with it. Positional metadata
+    also distinguishes different scalar parameters with the same name.
+    """
+    scalar_indices = {param: i for i, param in enumerate(func.params) if param not in func.buffer_map and param.dtype != "handle"}
+    result = {}
+    for output_index in result_idx:
+        buffer = func.buffer_map[func.params[output_index]]
+        for dim_index, dim in enumerate(buffer.shape):
+            if isinstance(dim, tvm.tirx.Var) and dim in scalar_indices:
+                result[output_index, dim_index] = scalar_indices[dim]
+    return result
+
+
 def match_global_kernel(source: str, annotation: str = "__global__") -> int:
     pattern = r"__global__\s+void\s+[__launch_bounds__\(\d+\)\s+]\w+"
     for line in source.split("\n"):
@@ -115,6 +132,7 @@ def pythonic_expr(
     floor_div_op: str = "/",
     func_name_map: dict[str, str] | None = None,
     expression_style: Literal["legacy", "python", "cxx"] = "legacy",
+    var_name_map: dict[tvm.tirx.Var, str] | None = None,
 ) -> str:
     """
     Converts a TVM PrimExpr into a Python-style string, correctly handling operator precedence.
@@ -131,6 +149,7 @@ def pythonic_expr(
                        {"max": "std::max"} when generating C++.
         expression_style: Controls conditional and logical operator spelling.
                           ``legacy`` preserves the historical output.
+        var_name_map: Optional identity-based names for variables in generated wrappers.
     Returns:
         A string representation of the expression.
     """
@@ -195,7 +214,10 @@ def pythonic_expr(
             return
 
         if isinstance(node, tvm.tirx.Var):
-            s, p = node.name, ATOMIC_PRECEDENCE
+            s, p = (
+                (var_name_map.get(node, node.name) if var_name_map is not None else node.name),
+                ATOMIC_PRECEDENCE,
+            )
         elif isinstance(node, (tvm.tirx.IntImm, tvm.tirx.FloatImm)):
             s, p = str(node.value), ATOMIC_PRECEDENCE
         elif isinstance(node, tvm.tirx.Cast):
@@ -313,13 +335,14 @@ def maybe_desc_name(name: str, matches: list[str], i: int, desc_name_map: dict[s
     if not (match == name + "_desc" or match.startswith(name + "_desc_")):
         return False
     desc_decls = []
-    if desc_name_map is not None:
-        desc_name_map[match] = name
     if i > 0:
         desc_decls.append(matches[i - 1])
     if i < len(matches) - 1:
         desc_decls.append(matches[i + 1])
-    return any([decl == "CUtensorMap" for decl in desc_decls])
+    is_descriptor = any(decl == "CUtensorMap" for decl in desc_decls)
+    if is_descriptor and desc_name_map is not None:
+        desc_name_map[match] = name
+    return is_descriptor
 
 
 def parse_function_call_args(
